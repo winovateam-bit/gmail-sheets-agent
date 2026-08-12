@@ -13,7 +13,13 @@
 	"upload_source_maps": true,
 	"compatibility_flags": [
 		"nodejs_compat"
-	]
+	],
+	"kv_namespaces": [
+		{
+			"binding": "AGENT_KV",
+			"id": "c0db7ee4ff5e43b3814ccdaba2d5d470"
+		}
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -31,15 +37,28 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": {  "directory": "./public/",  "binding": "ASSETS" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
+	"vars": {
+    "GOOGLE_SHEET_ID": "1JsJPaA1nqz2uvdqhJPKTnbWcRwFXdmYI67DKFCOp2U4"
+  },
+
+  /**
+   * Static Assets
+   * https://developers.cloudflare.com/workers/wrangler/configuration/static-assets/
+   */
+  // "assets": { "directory": "./public/", "binding": "ASSETS" },
+  /**
+   * Service Bindings (communicate between multiple Workers)
+   * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
+   */
+  // "services": [ { "binding": "MY_SERVICE", "service": "my-service" } ]
+
+/**
+   * Cron Triggers (Automated scheduling)
+   */
+  "triggers": {
+    "crons": ["*/15 * * * *"]  // Runs every 15 minutes (adjust schedule as needed)
+  }
 }
+
+
+
