@@ -1,15 +1,160 @@
 /**
- * Welcome to Cloudflare Workers! This is your first worker.
+ * HTTP entry point and cron handler.
  *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
+ * Routes:
+ *   GET /               health/landing text
+ *   GET /oauth/start    begin the Google consent flow
+ *   GET /oauth/callback Google redirects here with ?code=...&state=...
+ *   GET /run            scan the inbox and extract leads
  *
- * Learn more at https://developers.cloudflare.com/workers/
+ * /oauth/start and /run are guarded by RUN_TOKEN when it is configured;
+ * /oauth/callback cannot be, because Google calls it (its CSRF protection is
+ * the single-use `state` value instead).
  */
 
+import { handleOAuthStart, handleOAuthCallback } from './oauth.js';
+import { handleRun } from './run.js';
+
+/** Paths that require RUN_TOKEN when one is configured. */
+const PROTECTED_PATHS = new Set(['/oauth/start', '/run']);
+
+/**
+ * @param {string} message
+ * @param {number} status
+ * @returns {Response}
+ */
+function jsonError(message, status) {
+	return new Response(JSON.stringify({ error: message }, null, 2), {
+		status,
+		headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+	});
+}
+
+/**
+ * Hash a value to a hex digest.
+ *
+ * @param {string} value
+ * @returns {Promise<string>}
+ */
+async function sha256Hex(value) {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Check the shared secret guarding /run and /oauth/start.
+ *
+ * The gate is opt-in: with no RUN_TOKEN configured, both endpoints are open.
+ * Set it in any deployment reachable from the internet — /run returns extracted
+ * lead data and spends Claude credits on every call.
+ *
+ * Both sides are hashed before comparison so the comparison runs over
+ * fixed-length digests. `===` on a raw secret returns as soon as it finds a
+ * differing byte, which leaks the token a character at a time; digests are not
+ * invertible, so the same leak reveals nothing usable.
+ *
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {Promise<boolean>}
+ */
+async function isAuthorized(request, env) {
+	if (!env.RUN_TOKEN) return true;
+
+	// The query parameter exists so the flow can be started from a browser; it
+	// lands in access logs and browser history, so prefer the header where the
+	// caller controls it (cron, scripts).
+	const url = new URL(request.url);
+	const token = request.headers.get('x-run-token') ?? url.searchParams.get('token');
+	if (!token) return false;
+
+	const [supplied, expected] = await Promise.all([sha256Hex(token), sha256Hex(env.RUN_TOKEN)]);
+	return supplied === expected;
+}
+
+/**
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {Promise<Response>}
+ */
+async function route(request, env) {
+	const url = new URL(request.url);
+
+	if (request.method !== 'GET') {
+		return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
+	}
+
+	if (PROTECTED_PATHS.has(url.pathname) && !(await isAuthorized(request, env))) {
+		return jsonError('Unauthorized', 401);
+	}
+
+	switch (url.pathname) {
+		case '/oauth/start':
+			return handleOAuthStart(request, env);
+
+		case '/oauth/callback':
+			return handleOAuthCallback(request, env);
+
+		case '/run':
+			return handleRun(env);
+
+		case '/':
+			return new Response('Gmail Sheets Agent. Visit /oauth/start to connect a Google account.', {
+				headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+			});
+
+		default:
+			return new Response('Not Found', { status: 404 });
+	}
+}
+
 export default {
+	/**
+	 * @param {Request} request
+	 * @param {Env} env
+	 * @param {ExecutionContext} ctx
+	 * @returns {Promise<Response>}
+	 */
 	async fetch(request, env, ctx) {
-		return new Response("Hello World!");
+		try {
+			// `await` rather than returning the promise directly: a rejection has to
+			// settle inside this try block for the catch to see it.
+			return await route(request, env);
+		} catch (error) {
+			// The message may name internal state or credentials, so it goes to the
+			// log (`wrangler tail`) rather than to the caller.
+			console.error('[worker] unhandled error:', error?.stack ?? error);
+			return jsonError('Internal Server Error', 500);
+		}
+	},
+
+	/**
+	 * Cron trigger — same pipeline as GET /run.
+	 *
+	 * There is no caller to return a Response to, so the outcome is logged
+	 * instead. Lead fields are deliberately not logged: they are personal data
+	 * and the spreadsheet is where they belong.
+	 *
+	 * @param {ScheduledController} controller
+	 * @param {Env} env
+	 * @param {ExecutionContext} ctx
+	 */
+	async scheduled(controller, env, ctx) {
+		ctx.waitUntil(
+			handleRun(env)
+				.then(async (response) => {
+					const body = await response.json().catch(() => ({}));
+					if (response.status !== 200) {
+						console.error(`[cron] run failed (HTTP ${response.status}): ${body.error ?? 'unknown error'}`);
+						return;
+					}
+					console.log(
+						`[cron] processed ${body.processed}, skipped ${body.skipped}, leads ${body.new_leads?.length ?? 0}, ` +
+							`written ${body.written_to_sheet}${body.sheet_error ? `, sheet error: ${body.sheet_error}` : ''}`,
+					);
+				})
+				.catch((error) => {
+					console.error('[cron] run threw:', error?.stack ?? error);
+				}),
+		);
 	},
 };
