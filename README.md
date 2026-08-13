@@ -30,9 +30,9 @@ A failure on one message is recorded in the response and the run continues. Only
 | Method & path         | Purpose                                                                 |
 | --------------------- | ----------------------------------------------------------------------- |
 | `GET /`               | Plain-text landing page                                                 |
-| `GET /oauth/start`    | Redirects to Google's consent screen. Guarded by `RUN_TOKEN` if set.    |
+| `GET /oauth/start`    | Redirects to Google's consent screen. Requires `RUN_TOKEN`.             |
 | `GET /oauth/callback` | Google redirects here; exchanges the code and stores tokens in KV       |
-| `GET /run`            | Runs the pipeline and returns a JSON summary. Guarded by `RUN_TOKEN` if set. |
+| `GET /run`            | Runs the pipeline and returns a JSON summary. Requires `RUN_TOKEN`.     |
 
 Any other path returns `404`; any non-`GET` method returns `405`.
 
@@ -48,7 +48,7 @@ Any other path returns `404`; any non-`GET` method returns `405`.
 }
 ```
 
-`sheet_error` is present only when the spreadsheet write failed. A whole-run failure returns `502` with `{ "error": "...", "processed": 0, "skipped": 0, "new_leads": [], "failed": [] }`. An unexpected error returns `500` with `{ "error": "Internal Server Error" }` — the detail goes to the logs, not to the caller.
+`sheet_error` is present only when the spreadsheet write failed. A whole-run failure returns `502` with `{ "error": "...", "processed": 0, "skipped": 0, "new_leads": [], "failed": [] }`. A missing or wrong `RUN_TOKEN` returns `401`, and an unconfigured one returns `500` naming the missing secret. Any other unexpected error returns `500` with `{ "error": "Internal Server Error" }` — the detail goes to the logs, not to the caller.
 
 ## Environment variables & secrets
 
@@ -59,7 +59,7 @@ Any other path returns `404`; any non-`GET` method returns `405`.
 | `GOOGLE_CLIENT_ID`     | `secret`       | yes      | OAuth 2.0 client ID from the Google Cloud console                                                                     |
 | `GOOGLE_CLIENT_SECRET` | `secret`       | yes      | OAuth 2.0 client secret                                                                                               |
 | `ANTHROPIC_API_KEY`    | `secret`       | yes      | Claude API key                                                                                                        |
-| `RUN_TOKEN`            | `secret`       | no       | When set, `/oauth/start` and `/run` require it as an `X-Run-Token` header or `?token=` query parameter. **When unset, both endpoints are open** — set it on any deployment reachable from the internet. |
+| `RUN_TOKEN`            | `secret`       | yes      | Shared secret for `/oauth/start` and `/run`, sent as an `X-Run-Token` header or `?token=` query parameter. **The gate fails closed:** with no `RUN_TOKEN` configured those two endpoints return `500` rather than serving unauthenticated. Use any long random string. |
 | `OAUTH_REDIRECT_URI`   | `var`          | no       | Pins the OAuth redirect URI. Defaults to `<current origin>/oauth/callback`; set it only when running behind a proxy.  |
 
 ## Setup
@@ -106,8 +106,14 @@ Locally, create `.dev.vars` (gitignored):
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 ANTHROPIC_API_KEY=...
-# Optional; when set, /oauth/start and /run require it
+# Required — /oauth/start and /run refuse to serve without it
 RUN_TOKEN=...
+```
+
+Generate a `RUN_TOKEN` with any source of randomness, for example:
+
+```bash
+node -e "console.log(crypto.randomUUID())"
 ```
 
 For a deployed Worker, use Wrangler secrets instead:
@@ -125,17 +131,16 @@ Start the dev server and visit `/oauth/start`:
 
 ```bash
 npm run dev
-# then open http://localhost:8787/oauth/start
-# with RUN_TOKEN set: http://localhost:8787/oauth/start?token=<RUN_TOKEN>
+# then open http://localhost:8787/oauth/start?token=<RUN_TOKEN>
 ```
+
+The token goes in the query string here because a browser cannot set a header. That URL lands in browser history and access logs, so use the header form everywhere else.
 
 Accept **every** permission on the consent screen — the confirmation page names any scope you declined, and a missing scope surfaces later as a `403`. The tokens land in KV under `google_tokens` and are reused by every later run, including cron.
 
 ### 7. Trigger a run
 
 ```bash
-curl http://localhost:8787/run
-# with RUN_TOKEN set:
 curl -H "X-Run-Token: <RUN_TOKEN>" http://localhost:8787/run
 ```
 
@@ -173,7 +178,7 @@ Columns are written in this order; the position is what matters, so a renamed he
 
 Processed markers expire after 30 days (`PROCESSED_TTL_SECONDS`). A message older than that which is still in the recent-20 window would be re-classified, and its row updated in place rather than duplicated.
 
-Cron runs bypass the `RUN_TOKEN` check — it guards the HTTP route, not the scheduled handler. Watch a run with:
+Cron runs bypass the `RUN_TOKEN` check — the gate guards the HTTP route, not the scheduled handler, which Cloudflare invokes directly with no request to authenticate. A scheduled run therefore keeps working even if the secret is missing, while `GET /run` returns `500`. Watch a run with:
 
 ```bash
 npx wrangler tail
@@ -186,7 +191,7 @@ npx vitest run     # once
 npm test           # watch mode
 ```
 
-Tests run against the real `workerd` runtime via `@cloudflare/vitest-pool-workers`. Gmail, Claude, and Sheets are stubbed at `globalThis.fetch`; no network calls and no API spend. The suite clears `RUN_TOKEN` from the test environment so results don't depend on your local `.dev.vars`.
+Tests run against the real `workerd` runtime via `@cloudflare/vitest-pool-workers`. Gmail, Claude, and Sheets are stubbed at `globalThis.fetch`; no network calls and no API spend. The suite pins its own `RUN_TOKEN` in the test environment so results don't depend on your local `.dev.vars`.
 
 ## Project layout
 
@@ -205,7 +210,8 @@ test/        one spec per module
 
 | Symptom | Likely cause |
 | --- | --- |
-| `401 {"error":"Unauthorized"}` | `RUN_TOKEN` is set but the request has no matching `X-Run-Token` header or `?token=` |
+| `401 {"error":"Unauthorized"}` | The request has no matching `X-Run-Token` header or `?token=` |
+| `500` naming `RUN_TOKEN` | The secret is not set on this Worker. The endpoints fail closed rather than serving open — set it with `npx wrangler secret put RUN_TOKEN` (or add it to `.dev.vars` locally) |
 | `502` naming `/oauth/start` | No tokens in KV yet, or the refresh token was revoked — re-run the consent flow |
 | `403` from Gmail or Sheets | A scope was declined during consent, or the connected account cannot edit the sheet |
 | `redirect_uri_mismatch` from Google | The redirect URI in the console doesn't exactly match the one the Worker sends |

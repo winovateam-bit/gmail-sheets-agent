@@ -117,8 +117,10 @@ function stubUpstream({ messages, classify, onTokenRefresh, sheetsFail = false }
 	};
 }
 
+const RUN_TOKEN = 'test-run-token';
+
 async function run() {
-	const request = new Request('http://localhost:8787/run');
+	const request = new Request('http://localhost:8787/run', { headers: { 'x-run-token': RUN_TOKEN } });
 	const ctx = createExecutionContext();
 	const response = await worker.fetch(request, env, ctx);
 	await waitOnExecutionContext(ctx);
@@ -131,8 +133,10 @@ beforeEach(async () => {
 	env.ANTHROPIC_API_KEY = 'sk-ant-test';
 	env.GOOGLE_SHEET_ID = 'sheet-123';
 
-	// `.dev.vars` may define RUN_TOKEN locally; these tests call /run unauthenticated.
-	delete env.RUN_TOKEN;
+	// /run refuses to serve without this; pin it rather than inheriting whatever
+	// a local (gitignored) .dev.vars defines. The gate itself is covered in
+	// index.spec.js — run() below always authenticates.
+	env.RUN_TOKEN = RUN_TOKEN;
 
 	// Clear state left by other tests in this isolate.
 	await env.AGENT_KV.delete(TOKENS_KV_KEY);

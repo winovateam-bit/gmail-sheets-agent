@@ -9,15 +9,24 @@ beforeAll(() => {
 	env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
 });
 
+const RUN_TOKEN = 'test-run-token';
+
 beforeEach(() => {
-	// `.dev.vars` may define RUN_TOKEN locally, and the gate tests set it
-	// themselves — clear it so no test depends on a gitignored file.
-	delete env.RUN_TOKEN;
+	// Protected endpoints refuse to serve without this, so pin it rather than
+	// inheriting whatever a local (gitignored) .dev.vars happens to define.
+	env.RUN_TOKEN = RUN_TOKEN;
 });
 
-/** Run a GET through the worker without following redirects. */
-async function get(path, init) {
-	const request = new Request(`http://localhost:8787${path}`, init);
+/**
+ * Run a GET through the worker without following redirects.
+ *
+ * Sends the run token by default; pass `auth: false` to omit it.
+ */
+async function get(path, { auth = true, ...init } = {}) {
+	const headers = new Headers(init.headers);
+	if (auth) headers.set('x-run-token', RUN_TOKEN);
+
+	const request = new Request(`http://localhost:8787${path}`, { ...init, headers });
 	const ctx = createExecutionContext();
 	const response = await worker.fetch(request, env, ctx);
 	await waitOnExecutionContext(ctx);
@@ -146,44 +155,56 @@ describe('routing', () => {
 });
 
 describe('RUN_TOKEN gate', () => {
-	const TOKEN = 'super-secret-token';
-
 	it('401s the protected paths when the token is missing', async () => {
-		env.RUN_TOKEN = TOKEN;
-
 		for (const path of ['/oauth/start', '/run']) {
-			const response = await get(path);
+			const response = await get(path, { auth: false });
 			expect(response.status).toBe(401);
 			expect(await response.json()).toEqual({ error: 'Unauthorized' });
 		}
 	});
 
 	it('401s a wrong token', async () => {
-		env.RUN_TOKEN = TOKEN;
-		const response = await get('/oauth/start', { headers: { 'x-run-token': 'not-the-token' } });
+		const response = await get('/oauth/start', { auth: false, headers: { 'x-run-token': 'not-the-token' } });
 		expect(response.status).toBe(401);
 	});
 
 	it('accepts the token as a header or a query parameter', async () => {
-		env.RUN_TOKEN = TOKEN;
-
-		const viaHeader = await get('/oauth/start', { headers: { 'x-run-token': TOKEN } });
+		const viaHeader = await get('/oauth/start');
 		expect(viaHeader.status).toBe(302);
 
-		const viaQuery = await get(`/oauth/start?token=${TOKEN}`);
+		const viaQuery = await get(`/oauth/start?token=${RUN_TOKEN}`, { auth: false });
 		expect(viaQuery.status).toBe(302);
 	});
 
 	it('never gates the OAuth callback — Google calls it without a token', async () => {
-		env.RUN_TOKEN = TOKEN;
-		const response = await get('/oauth/callback?code=abc&state=not-a-real-state');
+		const response = await get('/oauth/callback?code=abc&state=not-a-real-state', { auth: false });
 		expect(response.status).toBe(400);
 		expect(await response.text()).toContain('Invalid or expired state');
 	});
 
-	it('leaves the endpoints open when no token is configured', async () => {
-		// RUN_TOKEN is unset here (see afterEach) — the gate is opt-in.
+	it('500s the protected paths when RUN_TOKEN is not configured', async () => {
+		// A missing secret is a deployment mistake, not consent to run open:
+		// the endpoint refuses rather than serving unauthenticated.
+		delete env.RUN_TOKEN;
+
+		for (const path of ['/oauth/start', '/run']) {
+			const response = await get(path, { auth: false });
+			expect(response.status).toBe(500);
+			expect((await response.json()).error).toContain('RUN_TOKEN is not configured');
+		}
+	});
+
+	it('500s even when the caller supplies a token, if none is configured', async () => {
+		delete env.RUN_TOKEN;
+
 		const response = await get('/oauth/start');
-		expect(response.status).toBe(302);
+		expect(response.status).toBe(500);
+	});
+
+	it('still serves unprotected paths with no RUN_TOKEN configured', async () => {
+		delete env.RUN_TOKEN;
+
+		expect((await get('/', { auth: false })).status).toBe(200);
+		expect((await get('/oauth/callback?state=x', { auth: false })).status).toBe(400);
 	});
 });

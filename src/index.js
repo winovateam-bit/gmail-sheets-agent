@@ -7,15 +7,15 @@
  *   GET /oauth/callback Google redirects here with ?code=...&state=...
  *   GET /run            scan the inbox and extract leads
  *
- * /oauth/start and /run are guarded by RUN_TOKEN when it is configured;
- * /oauth/callback cannot be, because Google calls it (its CSRF protection is
- * the single-use `state` value instead).
+ * /oauth/start and /run require the RUN_TOKEN secret, and refuse to serve at
+ * all if it is unset. /oauth/callback is not guarded, because Google calls it;
+ * its CSRF protection is the single-use `state` value instead.
  */
 
 import { handleOAuthStart, handleOAuthCallback } from './oauth.js';
 import { handleRun } from './run.js';
 
-/** Paths that require RUN_TOKEN when one is configured. */
+/** Paths that require RUN_TOKEN. */
 const PROTECTED_PATHS = new Set(['/oauth/start', '/run']);
 
 /**
@@ -44,9 +44,11 @@ async function sha256Hex(value) {
 /**
  * Check the shared secret guarding /run and /oauth/start.
  *
- * The gate is opt-in: with no RUN_TOKEN configured, both endpoints are open.
- * Set it in any deployment reachable from the internet — /run returns extracted
- * lead data and spends Claude credits on every call.
+ * The gate fails closed. A missing RUN_TOKEN is a deployment mistake, not a
+ * decision to run without auth, so it refuses the request outright rather than
+ * serving it unauthenticated — /run returns extracted lead data and spends
+ * Claude credits on every call, and /oauth/start lets a stranger overwrite the
+ * connected Google account.
  *
  * Both sides are hashed before comparison so the comparison runs over
  * fixed-length digests. `===` on a raw secret returns as soon as it finds a
@@ -55,20 +57,23 @@ async function sha256Hex(value) {
  *
  * @param {Request} request
  * @param {Env} env
- * @returns {Promise<boolean>}
+ * @returns {Promise<Response | null>} a response to send, or null when authorized
  */
-async function isAuthorized(request, env) {
-	if (!env.RUN_TOKEN) return true;
+async function checkAuthorization(request, env) {
+	if (!env.RUN_TOKEN) {
+		console.error('[worker] RUN_TOKEN is not configured — refusing to serve a protected endpoint');
+		return jsonError('RUN_TOKEN is not configured on this Worker. Set it with: npx wrangler secret put RUN_TOKEN', 500);
+	}
 
 	// The query parameter exists so the flow can be started from a browser; it
 	// lands in access logs and browser history, so prefer the header where the
 	// caller controls it (cron, scripts).
 	const url = new URL(request.url);
 	const token = request.headers.get('x-run-token') ?? url.searchParams.get('token');
-	if (!token) return false;
+	if (!token) return jsonError('Unauthorized', 401);
 
 	const [supplied, expected] = await Promise.all([sha256Hex(token), sha256Hex(env.RUN_TOKEN)]);
-	return supplied === expected;
+	return supplied === expected ? null : jsonError('Unauthorized', 401);
 }
 
 /**
@@ -83,8 +88,9 @@ async function route(request, env) {
 		return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET' } });
 	}
 
-	if (PROTECTED_PATHS.has(url.pathname) && !(await isAuthorized(request, env))) {
-		return jsonError('Unauthorized', 401);
+	if (PROTECTED_PATHS.has(url.pathname)) {
+		const refusal = await checkAuthorization(request, env);
+		if (refusal) return refusal;
 	}
 
 	switch (url.pathname) {
