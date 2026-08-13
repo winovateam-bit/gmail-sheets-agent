@@ -7,7 +7,7 @@ An automated, serverless agent built on Cloudflare Workers that reads recent Gma
 Every run (cron or a manual `GET /run`) does the following:
 
 1. Loads the stored Google tokens from KV, refreshing the access token if it has expired.
-2. Lists the 20 most recent inbox messages.
+2. Lists the 10 most recent inbox messages (`MAX_MESSAGES` in `src/run.js`).
 3. Drops any message already marked `processed:<id>` in KV, so nothing is classified twice.
 4. Fetches the rest in full and extracts subject, sender, date, and plaintext body.
 5. Asks Claude Haiku 4.5, with a pinned JSON schema, whether each message is a lead and what the lead details are.
@@ -147,6 +147,16 @@ npm run deploy
 
 The deployed Worker keeps its own KV data and secrets, so repeat step 6 against the deployed URL once to connect the account there.
 
+#### Choose a Workers plan before going live
+
+**A Worker invocation may make at most 50 subrequests on the free plan, and 1,000 on [Workers Paid](https://developers.cloudflare.com/workers/platform/pricing/) ($5/month.)** KV reads and writes count toward that limit alongside every Gmail, Claude, and Sheets call — so the limit, not the schedule, is what caps how much mail a single run can get through.
+
+`MAX_MESSAGES` is set to **10** for this reason. A ten-message run costs roughly 48 subrequests: one Gmail listing, ten message fetches, ten Claude calls, ten KV reads and ten KV writes for the processed markers, a couple for the stored token, and about five for Sheets. That fits the free plan, but only just — a run that also refreshes the access token, or that both appends new rows and updates existing ones, sits at the ceiling, and the Claude SDK retries a failed call twice by default. A run that exceeds the limit fails partway through; the messages it did classify stay marked processed, and the rest are picked up on the next run.
+
+**Upgrade to Workers Paid for any inbox with meaningful volume.** Ten messages per run, every 15 minutes, is a ceiling of 40 messages an hour under perfect conditions — and any mailbox that receives more than ten messages in one interval will push older ones out of the recent-messages window before they are ever looked at, so they are silently never classified. On the paid plan the subrequest budget stops being the constraint: raise `MAX_MESSAGES` in `src/run.js` to 20 or more, and the run is then bounded by the 30-second CPU limit rather than by subrequests.
+
+The other paid-plan limits are generous relative to this workload — 10 million requests and 30 million CPU-milliseconds a month are included, and this agent's spend is dominated by the Claude and Google API calls rather than by Workers itself.
+
 ## The Leads tab
 
 Columns are written in this order; the position is what matters, so a renamed header row is left alone (and logged) rather than overwritten.
@@ -159,7 +169,7 @@ Columns are written in this order; the position is what matters, so a renamed he
 
 ## Scheduling
 
-`wrangler.jsonc` sets a cron trigger of `*/15 * * * *` — every 15 minutes. Each run looks at the 20 most recent inbox messages, so a mailbox receiving more than 20 messages in one interval can push older ones out of the window before they are ever classified. Widen the interval, or raise `MAX_MESSAGES` in `src/run.js`, if that applies to you.
+`wrangler.jsonc` sets a cron trigger of `*/15 * * * *` — every 15 minutes. Each run looks at the 10 most recent inbox messages, so a mailbox receiving more than 10 in one interval pushes older ones out of the window before they are ever classified, and they are never picked up. Shorten the interval, or raise `MAX_MESSAGES` in `src/run.js` — but read the plan note under [Deploy](#8-deploy) first, since `MAX_MESSAGES` is bounded by the subrequest limit of the plan you are on.
 
 Processed markers expire after 30 days (`PROCESSED_TTL_SECONDS`). A message older than that which is still in the recent-20 window would be re-classified, and its row updated in place rather than duplicated.
 

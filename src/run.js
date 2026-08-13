@@ -3,7 +3,7 @@
  *
  * Pipeline per run:
  *   1. load Google tokens from KV, refreshing them if expired
- *   2. list the 20 most recent inbox messages
+ *   2. list the most recent inbox messages (see MAX_MESSAGES)
  *   3. skip any message already marked `processed:<id>` in KV
  *   4. fetch the rest in full, extract subject/from/date/plaintext body
  *   5. ask Claude whether each is a sales lead and pull the details out
@@ -20,8 +20,21 @@ import { listInboxMessageIds, getMessage, extractMessageContent } from './gmail.
 import { extractLead } from './leads.js';
 import { writeLeadsToSheet } from './sheets.js';
 
-/** How many recent inbox messages to look at per run. */
-const MAX_MESSAGES = 20;
+/**
+ * How many recent inbox messages to look at per run.
+ *
+ * Sized for the Workers *free* plan, which allows 50 subrequests per
+ * invocation — and KV operations count against that budget alongside fetch.
+ * Ten messages costs roughly: 1 Gmail list + 10 Gmail gets + 10 Claude calls
+ * + 10 KV reads + 10 KV writes + ~2 for the token + ~5 for Sheets, which lands
+ * just under the ceiling. A run that also refreshes the access token and both
+ * appends and updates sheet rows sits right at it, and the Claude SDK's
+ * automatic retries can push a failing run over.
+ *
+ * On the paid plan the limit is 1000, so raise this to 20+ there — see the
+ * deployment section of the README.
+ */
+const MAX_MESSAGES = 10;
 
 /** Remember processed message IDs for 30 days, so a re-run never double-reports a lead. */
 const PROCESSED_TTL_SECONDS = 30 * 24 * 60 * 60;
